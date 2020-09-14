@@ -2,23 +2,38 @@ import * as vscode from 'vscode';
 import net = require('net');
 import { spawn, ChildProcess } from 'child_process';
 import { dirname } from 'path';
-import getPort = require('get-port');
-import * as fs from 'fs';
 
-interface REvalOutput {
+interface RSessionRequest {
+  id: number;
+  type: 'eval' | 'cancel';
+  expr?: any;
+}
+
+interface RSessionResponse {
+  id: number;
   type: 'text' | 'plot' | 'viewer' | 'browser' | 'error';
   result: string;
 }
 
 class RKernel {
   private kernelScript: string;
+  private doc: vscode.NotebookDocument;
   private cwd: string;
   private process: ChildProcess;
   private port: number;
+  private socket: net.Socket;
 
   constructor(kernelScript: string, doc: vscode.NotebookDocument) {
     this.kernelScript = kernelScript;
     this.cwd = dirname(doc.uri.fsPath);
+    this.doc = doc;
+  }
+
+  private request(request: RSessionRequest) {
+    if (this.socket) {
+      const json = JSON.stringify(request);
+      this.socket.write(`Content-Length: ${json.length}\n${json}`);
+    }
   }
 
   public async start() {
@@ -29,23 +44,92 @@ class RKernel {
     const env = Object.create(process.env);
     env.LANG = 'en_US.UTF-8';
 
-    this.port = await getPort();
-    const childProcess = spawn('R', ['--quiet', '--slave', '-f', this.kernelScript, '--args', `port=${this.port}`],
-      { cwd: this.cwd, env: env });
-    childProcess.stderr.on('data', (chunk: Buffer) => {
-      const str = chunk.toString();
-      console.log(`R stderr (${childProcess.pid}): ${str}`);
-    });
-    childProcess.stdout.on('data', (chunk: Buffer) => {
-      const str = chunk.toString();
-      console.log(`R stdout (${childProcess.pid}): ${str}`);
-    });
-    childProcess.on('exit', (code, signal) => {
-      console.log(`R exited with code ${code}`);
-    });
-    this.process = childProcess;
+    return new Promise((resolve, reject) => {
+      const server = net.createServer(socket => {
+        console.log('socket connected');
+        this.socket = socket;
+        resolve(undefined);
 
-    return new Promise((resolve) => setTimeout(resolve, 500));
+        socket.on('data', async (data) => {
+          const response: RSessionResponse = JSON.parse(data.toString());
+          const cell = this.doc.cells.find(cell => cell.metadata.executionOrder === response.id);
+          if (cell) {
+            cell.metadata.runState = vscode.NotebookCellRunState.Success;
+            cell.metadata.lastRunDuration = +new Date() - cell.metadata.runStartTime;
+
+            console.log(`uri: ${cell.uri}, id: ${response.id}, type: ${response.type}, result: ${response.result}`);
+            switch (response.type) {
+              case 'text':
+                cell.outputs = [{
+                  outputKind: vscode.CellOutputKind.Text,
+                  text: response.result,
+                }];
+                break;
+              case 'plot':
+                cell.outputs = [{
+                  outputKind: vscode.CellOutputKind.Rich,
+                  data: {
+                    'image/svg+xml': (await vscode.workspace.fs.readFile(vscode.Uri.parse(response.result))).toString(),
+                  },
+                }];
+                break;
+              case 'viewer':
+                cell.outputs = [{
+                  outputKind: vscode.CellOutputKind.Rich,
+                  data: {
+                    'application/json': response.result,
+                  },
+                }];
+                break;
+              case 'browser':
+                cell.outputs = [{
+                  outputKind: vscode.CellOutputKind.Rich,
+                  data: {
+                    'application/json': response.result,
+                  },
+                }];
+                break;
+              case 'error':
+                cell.metadata.runState = vscode.NotebookCellRunState.Error;
+                cell.outputs = [{
+                  outputKind: vscode.CellOutputKind.Error,
+                  evalue: response.result,
+                  ename: '',
+                  traceback: [],
+                }];
+                break;
+            }
+          }
+        });
+
+        socket.on('end', () => {
+          console.log('socket disconnected');
+          this.socket = undefined;
+          reject(undefined);
+        });
+        server.close();
+      });
+
+      server.listen(0, '127.0.0.1', () => {
+        this.port = (server.address() as net.AddressInfo).port;
+        const childProcess = spawn('R', ['--quiet', '--slave', '-f', this.kernelScript, '--args', `port=${this.port}`],
+          { cwd: this.cwd, env: env });
+        childProcess.stderr.on('data', (chunk: Buffer) => {
+          const str = chunk.toString();
+          console.log(`R stderr (${childProcess.pid}): ${str}`);
+        });
+        childProcess.stdout.on('data', (chunk: Buffer) => {
+          const str = chunk.toString();
+          console.log(`R stdout (${childProcess.pid}): ${str}`);
+        });
+        childProcess.on('exit', (code, signal) => {
+          console.log(`R exited with code ${code}`);
+          reject(undefined);
+        });
+        this.process = childProcess;
+        return childProcess;
+      });
+    });
   }
 
   public stop() {
@@ -60,40 +144,21 @@ class RKernel {
     await this.start();
   }
 
-  public async eval(cell: vscode.NotebookCell): Promise<REvalOutput> {
-    if (this.process) {
-      const client = net.createConnection({ host: '127.0.0.1', port: this.port }, () => {
-        console.log(`uri: ${cell.uri}, connect`);
-        const request = JSON.stringify({
-          time: Date.now(),
-          expr: cell.document.getText(),
-        }).concat('\n');
-        console.log(`uri: ${cell.uri}, write: ${request}`);
-        client.write(request);
+  public eval(cell: vscode.NotebookCell) {
+    if (this.socket) {
+      this.request({
+        id: cell.metadata.executionOrder,
+        type: 'eval',
+        expr: cell.document.getText(),
       });
+    }
+  }
 
-      client.on('end', () => {
-        console.log(`uri: ${cell.uri}, end`);
-      });
-
-      return new Promise((resolve, reject) => {
-        client.on('data', (data) => {
-          const response = data.toString();
-          console.log(`uri: ${cell.uri}, data: ${response}`);
-          client.end();
-          const output: REvalOutput = JSON.parse(response);
-          resolve(output);
-        });
-
-        client.on('error', (err) => {
-          console.log(`uri: ${cell.uri}, error: ${err.name}, ${err.message}`);
-          reject({
-            type: 'error',
-            result: [
-              err.message
-            ],
-          });
-        });
+  public cancel(cell: vscode.NotebookCell) {
+    if (this.socket) {
+      this.request({
+        id: cell.metadata.executionOrder,
+        type: 'cancel',
       });
     }
   }
@@ -116,16 +181,18 @@ class RNotebook implements vscode.Disposable {
     this.kernel.restart();
   }
 
-  public async eval(cell: vscode.NotebookCell): Promise<REvalOutput> {
+  public async eval(cell: vscode.NotebookCell): Promise<void> {
     await this.kernel.start();
     return this.kernel.eval(cell);
+  }
+
+  public async cancel(cell: vscode.NotebookCell): Promise<void> {
+    return this.kernel.cancel(cell);
   }
 }
 
 export class RNotebookProvider implements vscode.NotebookContentProvider, vscode.NotebookKernel {
   public label = 'R Kernel';
-  // public kernel = this;
-
   private kernelScript: string;
   private disposables: vscode.Disposable[] = [];
   private readonly notebooks = new Map<string, RNotebook>();
@@ -138,7 +205,7 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
       vscode.notebook.registerNotebookKernelProvider({
         viewType: 'r-notebook'
       }, {
-          provideKernels: () => {
+        provideKernels: () => {
           return [this];
         }
       }),
@@ -165,7 +232,7 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
     const content = (await vscode.workspace.fs.readFile(uri)).toString();
     const lines = content.split(/\r?\n/);
     const cells: vscode.NotebookCellData[] = [];
-    
+
     let line = 0;
     let cellType = 'markdown';
     let cellStartLine = 0;
@@ -243,7 +310,7 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
 
     return {
       languages: ['r'],
-      metadata: { },
+      metadata: {},
       cells: cells,
     };
   }
@@ -298,7 +365,7 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
   async executeCell(document: vscode.NotebookDocument, cell: vscode.NotebookCell) {
     const notebook = this.notebooks.get(document.uri.toString());
 
-    if (!cell) {  
+    if (!cell) {
       if (notebook) {
         notebook.restartKernel();
       }
@@ -312,54 +379,13 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
       return;
     }
 
-    if (notebook) {
+    if (notebook && cell.metadata.runState !== vscode.NotebookCellRunState.Running) {
       try {
-        if (cell.metadata === undefined) {
-          cell.metadata = {};
-        }
-        
         cell.metadata.runState = vscode.NotebookCellRunState.Running;
         const start = +new Date();
         cell.metadata.runStartTime = start;
         cell.metadata.executionOrder = ++this.runIndex;
-        const output = await notebook.eval(cell);
-        console.log(`uri: ${cell.uri}, output.type: ${output.type}, output.result: ${output.result}`);
-        switch (output.type) {
-          case 'text':
-            cell.outputs = [{
-              outputKind: vscode.CellOutputKind.Text,
-              text: output.result,
-            }];
-            break;
-          case 'plot':
-            cell.outputs = [{
-              outputKind: vscode.CellOutputKind.Rich,
-              data: {
-                'image/svg+xml': (await vscode.workspace.fs.readFile(vscode.Uri.parse(output.result))).toString(),
-              }
-            }];
-            break;
-          case 'viewer':
-            cell.outputs = [{
-              outputKind: vscode.CellOutputKind.Rich,
-              data: {
-                'application/json': output,
-              }
-            }];
-            break;
-          case 'browser':
-            cell.outputs = [{
-              outputKind: vscode.CellOutputKind.Rich,
-              data: {
-                'application/json': output,
-              }
-            }];
-            break;
-          case 'error':
-            throw new Error(output.result);
-        }
-        cell.metadata.runState = vscode.NotebookCellRunState.Success;
-        cell.metadata.lastRunDuration = +new Date() - start;
+        await notebook.eval(cell);
       } catch (e) {
         cell.outputs = [{
           outputKind: vscode.CellOutputKind.Error,
@@ -380,7 +406,10 @@ export class RNotebookProvider implements vscode.NotebookContentProvider, vscode
   }
 
   async cancelCellExecution(document: vscode.NotebookDocument, cell: vscode.NotebookCell) {
-
+    if (cell.metadata.runState === vscode.NotebookCellRunState.Running) {
+      const notebook = this.notebooks.get(document.uri.toString());
+      await notebook.cancel(cell);
+    }
   }
 
   async cancelAllCellsExecution(document: vscode.NotebookDocument) {
