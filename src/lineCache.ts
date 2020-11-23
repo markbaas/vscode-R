@@ -41,7 +41,7 @@ export class LineCache {
 }
 
 function cleanLine(text: string) {
-    const cleaned = text.replace(/\s*\#.*/, '');
+    const cleaned = text.replace(/(.*(?<!").*(?!").*)(\#.*)/g, `$1`).trimEnd()
 
     return (cleaned);
 }
